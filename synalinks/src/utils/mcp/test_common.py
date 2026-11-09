@@ -1,0 +1,69 @@
+import contextlib
+import multiprocessing
+import socket
+import time
+from collections.abc import Generator
+
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+
+
+def run_streamable_server(server: MCPServer, server_port: int) -> None:
+    """Run an MCPServer in a separate process exposing a streamable HTTP endpoint."""
+    app = server.streamable_http_app()
+    uvicorn_server = uvicorn.Server(
+        config=uvicorn.Config(
+            app=app, host="127.0.0.1", port=server_port, log_level="error"
+        )
+    )
+    uvicorn_server.run()
+
+
+@contextlib.contextmanager
+def run_streamable_server_multiprocessing(
+    server: MCPServer, port: int
+) -> Generator[None, None, None]:
+    """Run the server in a separate process exposing a streamable HTTP endpoint.
+
+    The endpoint will be available at `http://localhost:{port}/mcp/`. The port
+    is explicit because MCP SDK v2's `MCPServer` does not carry one: it belongs
+    to whoever serves the app.
+    """
+    # Use the "fork" start method explicitly: the child inherits memory, so the
+    # MCPServer (which holds unpicklable local tool-handler closures) does
+    # not need to be pickled. Python 3.14 changed the default start method on
+    # Linux from "fork" to "forkserver"; pinning "fork" keeps the previous
+    # behavior on all supported versions (>=3.11) and fixes 3.14.
+    ctx = multiprocessing.get_context("fork")
+    proc = ctx.Process(
+        target=run_streamable_server,
+        kwargs={"server": server, "server_port": port},
+        daemon=True,
+    )
+    proc.start()
+
+    # Wait for server to be running
+    max_attempts = 20
+    attempt = 0
+
+    while attempt < max_attempts:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(("127.0.0.1", port))
+                break
+        except ConnectionRefusedError:
+            time.sleep(0.1)
+            attempt += 1
+    else:
+        raise RuntimeError(f"Server failed to start after {max_attempts} attempts")
+
+    try:
+        yield
+    finally:
+        # Signal the server to stop
+        proc.kill()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            raise RuntimeError(
+                "Server process is still alive after attempting to terminate it"
+            )

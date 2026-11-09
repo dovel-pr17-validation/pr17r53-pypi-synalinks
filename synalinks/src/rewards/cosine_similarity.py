@@ -1,0 +1,151 @@
+# Modified from: keras/src/losses/losses.py
+# Original authors: François Chollet et al. (Keras Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+
+from synalinks.src import tree
+from synalinks.src.api_export import synalinks_export
+from synalinks.src.backend import EmbeddingRequest
+from synalinks.src.backend.common import numpy as np
+from synalinks.src.modules.embedding_models import get as _get_em
+from synalinks.src.rewards.reward import squeeze_or_expand_to_same_rank
+from synalinks.src.rewards.reward_wrappers import RewardFunctionWrapper
+from synalinks.src.saving import serialization_lib
+
+
+@synalinks_export("synalinks.rewards.cosine_similarity")
+async def cosine_similarity(y_true, y_pred, embedding_model=None, axis=-1):
+    """
+    Computes the cosine similarity between `y_true` and `y_pred`.
+
+    Formula:
+
+    ```
+    reward = (sum(l2_norm(y_true) * l2_norm(y_pred))+1) / 2
+    ```
+
+    The formula is similar to the classic cosine similarity used in deep learning,
+    but scaled to [0.0, 1.0] and adjusted to have a reward that tend
+    towards 1.0 if the two objects are similar (and 0.0 otherwise).
+
+    Args:
+        y_true (JsonDataModel): The ground truth JSON data_model.
+        y_pred (JsonDataModel): The predicted JSON data_model.
+        embedding_model (EmbeddingModel): The embedding model to use to compute the
+            cosine similarity.
+        axis (int): (Optional) Defaults to `-1`. The dimension along which the cosine
+            similarity is computed.
+
+    Returns:
+        (float): The reward value, which tend to 1.0 if the values are similar,
+            and towards 0.0 otherwise.
+    """
+    reward = 0.0
+    if y_pred is not None and y_true is not None:
+        em = _get_em(embedding_model)
+        # Flatten each data model's fields to strings, embed, and pull
+        # the vectors out, same logic the old `ops.embedding` did.
+        y_true_texts = tree.flatten(
+            tree.map_structure(lambda f: str(f), y_true.get_json())
+        )
+        y_pred_texts = tree.flatten(
+            tree.map_structure(lambda f: str(f), y_pred.get_json())
+        )
+        y_true_result = await em(EmbeddingRequest(texts=y_true_texts))
+        y_pred_result = await em(EmbeddingRequest(texts=y_pred_texts))
+        y_true = np.convert_to_tensor(y_true_result.get("embeddings"))
+        y_pred = np.convert_to_tensor(y_pred_result.get("embeddings"))
+        y_true, y_pred = squeeze_or_expand_to_same_rank(y_true, y_pred)
+        y_pred = np.normalize(y_pred, axis=axis)
+        y_true = np.normalize(y_true, axis=axis)
+        reward = (np.sum(y_true * y_pred, axis=axis) + 1) / 2
+    return reward
+
+
+@synalinks_export(
+    [
+        "synalinks.CosineSimilarity",
+        "synalinks.rewards.CosineSimilarity",
+    ]
+)
+class CosineSimilarity(RewardFunctionWrapper):
+    """
+    Computes the cosine similarity between `y_true` and `y_pred`.
+
+    Formula:
+
+    ```
+    reward = (sum(l2_norm(y_true) * l2_norm(y_pred))+1) / 2
+    ```
+
+    The formula is similar to the classic cosine similarity used in deep learning,
+    but scaled to [0.0, 1.0] and adjusted to have a reward that tend
+    towards 1.0 if the two objects are similar (and 0.0 otherwise).
+
+    Example:
+
+    ```python
+    program.compile(
+        reward=synalinks.rewards.CosineSimilarity(
+            embedding_model=embedding_model
+        )
+        optimizer=synalinks.optimizers.RandomFewShot(),
+    )
+    ```
+
+    Args:
+        embedding_model (EmbeddingModel): The embedding model to use to compute the
+            cosine similarity.
+        axis (int): (Optional) Defaults to `-1`. The dimension along which the cosine
+            similarity is computed.
+        name (str): (Optional) string name of the reward instance.
+        in_mask (list): (Optional) list of keys to keep to compute the reward.
+        out_mask (list): (Optional) list of keys to remove to compute the reward.
+        in_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
+    """
+
+    def __init__(
+        self,
+        embedding_model=None,
+        axis=-1,
+        name="cosine_similarity",
+        in_mask=None,
+        out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
+    ):
+        super().__init__(
+            fn=cosine_similarity,
+            name=name,
+            in_mask=in_mask,
+            out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
+            axis=axis,
+            embedding_model=embedding_model,
+        )
+        self.embedding_model = embedding_model
+        self.axis = axis
+
+    def get_config(self):
+        return {
+            "embedding_model": serialization_lib.serialize_synalinks_object(
+                self.embedding_model
+            ),
+            "axis": self.axis,
+            "name": self.name,
+            "in_mask": self.in_mask,
+            "out_mask": self.out_mask,
+            "in_mask_pattern": self.in_mask_pattern,
+            "out_mask_pattern": self.out_mask_pattern,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        config = dict(config)
+        embedding_model = serialization_lib.deserialize_synalinks_object(
+            config.pop("embedding_model")
+        )
+        return cls(embedding_model=embedding_model, **config)

@@ -1,0 +1,260 @@
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+
+from synalinks.src.api_export import synalinks_export
+from synalinks.src.backend import DataModel
+from synalinks.src.backend import Field
+from synalinks.src.backend import SymbolicDataModel
+from synalinks.src.modules.core.generator import Generator
+from synalinks.src.modules.core.generator import _as_tool_list
+from synalinks.src.modules.core.generator import _tools_to_schemas
+from synalinks.src.modules.language_models import get as _get_lm
+from synalinks.src.modules.module import Module
+from synalinks.src.saving import serialization_lib
+
+
+class Thinking(DataModel):
+    thinking: str = Field(
+        description="Your step by step thinking",
+    )
+
+
+@synalinks_export(
+    [
+        "synalinks.modules.ChainOfThought",
+        "synalinks.ChainOfThought",
+    ]
+)
+class ChainOfThought(Module):
+    """Useful to answer in a step by step manner.
+
+    This component concatenate a thinking field to your data model/schema and generate
+    a prediction allowing the LM to think step by step before answering.
+
+    By default the reasoning_effort is set to 'low' which uses the model's internal
+    reasoning capabilities (extended thinking) to populate the thinking field.
+
+    Example:
+
+    ```python
+    import synalinks
+    import asyncio
+
+    class Query(synalinks.DataModel):
+        query: str = synalinks.Field(
+            description="The user query",
+        )
+
+    class Answer(synalinks.DataModel):
+        answer: str = synalinks.Field(
+            description="The correct answer",
+        )
+
+    async def main():
+
+        language_model = synalinks.LanguageModel(
+            model="anthropic/claude-3-7-sonnet-20250219",
+        )
+
+        x0 = synalinks.Input(data_model=Query)
+        x1 = await synalinks.ChainOfThought(
+            data_model=Answer,
+            language_model=language_model,
+        )(x0)
+
+        program = synalinks.Program(
+            inputs=x0,
+            outputs=x1,
+            name="answer_with_chain_of_thought",
+            description="Useful to answer step by step",
+        )
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    References:
+        - [Chain-of-Thought Prompting Elicits Reasoning in Large Language Models](https://arxiv.org/abs/2201.11903)
+
+    Args:
+        schema (dict): The target JSON schema.
+            If not provided use the `data_model` to infer it.
+        data_model (DataModel | SymbolicDataModel | JsonDataModel): The target data model.
+        language_model (LanguageModel): The language model to use.
+        prompt_template (str): The jinja2 prompt template (see `Generator`).
+        examples (list): The default list of examples, the examples
+            are a list of tuples containing input/output JSON pairs.
+        instructions (str): The default instructions being a string containing
+            instructions for the language model.
+        seed_instructions (list): Optional. A list of instructions to use as seed for the
+            optimization. If not provided, use the default instructions as seed.
+        temperature (float): Optional. The temperature for the LM call.
+        max_tokens (int): Optional. Maximum number of tokens to generate. Default
+            None (the model's own default; caps generation length when set).
+        top_p (float): Optional. The nucleus sampling probability for the LM call.
+            Default None (the model's own default).
+        top_k (int): Optional. The top-k sampling cutoff for the LM call.
+            Default None (the model's own default).
+        reasoning_effort (string): Optional. The reasoning effort for the LM call
+            between ['minimal', 'low', 'medium', 'high', 'xhigh', 'disable', 'none'].
+            (Default to 'low'). If reasoning effort is none or disabled, a thinking
+            field is automatically added to the output data model. Otherwise,
+            the thinking field is automatically populated by the model's
+            reasoning content.
+        use_inputs_schema (bool): Optional. Whether or not use the inputs schema in
+            the prompt (Default to False) (see `Generator`).
+        use_outputs_schema (bool): Optional. Whether or not use the outputs schema in
+            the prompt (Default to False) (see `Generator`).
+        return_inputs (bool): Optional. Whether or not to concatenate the inputs to
+            the outputs (Default to False) (see `Generator`).
+        streaming (bool): Optional. If true, stream the LM response. Only takes
+            effect when `data_model`/`schema` is `None` (Default to False).
+        tools (list): Optional. Live `synalinks.modules.Tool` objects (or a
+            `{name: Tool}` mapping) the underlying `Generator` always exposes,
+            merged with any passed to `call`. Serialized as `tool_schemas`
+            (see `Generator`).
+        tool_schemas (list): Optional. Already-wire-formatted tool declaration
+            dicts (OpenAI `{"type": "function", ...}` shape) the underlying
+            `Generator` always exposes, merged with any passed to `call`
+            (see `Generator`).
+        name (str): Optional. The name of the module.
+        description (str): Optional. The description of the module.
+        trainable (bool): Whether the module's variables should be trainable.
+    """
+
+    def __init__(
+        self,
+        *,
+        schema=None,
+        data_model=None,
+        language_model=None,
+        prompt_template=None,
+        prompt_variables=None,
+        examples=None,
+        instructions=None,
+        seed_instructions=None,
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        top_k=None,
+        reasoning_effort=None,
+        use_inputs_schema=False,
+        use_outputs_schema=False,
+        return_inputs=False,
+        streaming=False,
+        tools=None,
+        tool_schemas=None,
+        name=None,
+        description=None,
+        trainable=True,
+    ):
+        super().__init__(
+            name=name,
+            description=description,
+            trainable=trainable,
+        )
+
+        if not schema and data_model:
+            schema = data_model.get_schema()
+        self.schema = schema
+        self.language_model = _get_lm(language_model)
+        self.prompt_template = prompt_template
+        self.prompt_variables = dict(prompt_variables or {})
+        self.examples = examples
+        self.instructions = instructions
+        self.seed_instructions = seed_instructions
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+        # Default to "low" reasoning effort for ChainOfThought
+        if reasoning_effort is None:
+            reasoning_effort = "low"
+        self.reasoning_effort = reasoning_effort
+        self.use_inputs_schema = use_inputs_schema
+        self.use_outputs_schema = use_outputs_schema
+        self.return_inputs = return_inputs
+        # Streaming is only meaningful when there is no structured schema.
+        if self.schema and streaming:
+            streaming = False
+        self.streaming = streaming
+        self.tools = _as_tool_list(tools)
+        self.tool_schemas = tool_schemas
+
+        if self.schema:
+            final_data_model = Thinking + SymbolicDataModel(schema=self.schema)
+        else:
+            final_data_model = None
+
+        self.generator = Generator(
+            data_model=final_data_model,
+            language_model=self.language_model,
+            prompt_template=self.prompt_template,
+            prompt_variables=self.prompt_variables,
+            examples=self.examples,
+            instructions=self.instructions,
+            seed_instructions=self.seed_instructions,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            reasoning_effort=self.reasoning_effort,
+            use_inputs_schema=self.use_inputs_schema,
+            use_outputs_schema=self.use_outputs_schema,
+            return_inputs=self.return_inputs,
+            streaming=self.streaming,
+            tools=self.tools,
+            tool_schemas=self.tool_schemas,
+            name="generator_" + self.name,
+        )
+
+    async def call(self, inputs, tools=None, tool_schemas=None, training=False):
+        return await self.generator(
+            inputs, tools=tools, tool_schemas=tool_schemas, training=training
+        )
+
+    def get_config(self):
+        config = {
+            "schema": self.schema,
+            "prompt_template": self.prompt_template,
+            "prompt_variables": self.prompt_variables,
+            "examples": self.examples,
+            "instructions": self.instructions,
+            "seed_instructions": self.seed_instructions,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "reasoning_effort": self.reasoning_effort,
+            "use_inputs_schema": self.use_inputs_schema,
+            "use_outputs_schema": self.use_outputs_schema,
+            "return_inputs": self.return_inputs,
+            "streaming": self.streaming,
+            # Live `tools` are serialized as their wire form alongside
+            # `tool_schemas` (the way `data_model` is stored as `schema`).
+            "tool_schemas": (
+                list(self.tool_schemas or []) + _tools_to_schemas(self.tools)
+            )
+            or None,
+            "name": self.name,
+            "description": self.description,
+            "trainable": self.trainable,
+        }
+        language_model_config = {
+            "language_model": serialization_lib.serialize_synalinks_object(
+                self.language_model,
+            )
+        }
+        return {
+            **config,
+            **language_model_config,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        language_model = serialization_lib.deserialize_synalinks_object(
+            config.pop("language_model"),
+        )
+        return cls(
+            language_model=language_model,
+            **config,
+        )

@@ -1,0 +1,465 @@
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+
+import os
+import tempfile
+from unittest.mock import patch
+
+import orjson
+
+from synalinks.src import optimizers
+from synalinks.src import rewards
+from synalinks.src import testing
+from synalinks.src.backend import DataModel
+from synalinks.src.modules import Generator
+from synalinks.src.modules import Input
+from synalinks.src.modules import default_instructions
+from synalinks.src.modules.language_models import LanguageModel
+from synalinks.src.programs import Program
+from synalinks.src.utils.nlp_utils import remove_numerical_suffix
+from synalinks.src.version import __version__
+
+
+class Query(DataModel):
+    query: str
+
+
+class Answer(DataModel):
+    answer: str
+
+
+async def build_two_step_program(name):
+    """Two generators named after `name`, as an app builds one program per user."""
+    language_model = LanguageModel(model="ollama/mistral")
+    x0 = Input(data_model=Query)
+    x1 = await Generator(
+        data_model=Answer, language_model=language_model, name=f"draft_{name}"
+    )(x0)
+    x2 = await Generator(
+        data_model=Answer, language_model=language_model, name=f"refine_{name}"
+    )(x1)
+    return Program(inputs=x0, outputs=x2, name=f"program_{name}")
+
+
+class ProgramTest(testing.TestCase):
+    async def test_get_state(self):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(model="ollama/mistral")
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        data_model_fields = list(AnswerWithRationale.get_schema()["properties"].keys())
+        instructions = default_instructions(data_model_fields)
+
+        state_tree = program.get_state_tree()
+
+        expected_tree = {
+            "trainable_variables": {
+                "generator": {
+                    "state_generator": {
+                        "instructions": instructions,
+                        "examples": [],
+                        "current_predictions": [],
+                        "predictions": [],
+                        "history": [],
+                        "seed_candidates": [],
+                        "candidates": [],
+                        "best_candidates": [],
+                        "nb_visit": 0,
+                        "cumulative_reward": 0.0,
+                    }
+                }
+            },
+            "non_trainable_variables": {},
+            "metrics_variables": {},
+        }
+        self.assertEqual(state_tree, expected_tree)
+
+    async def test_recover_state(self):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(model="ollama/mistral")
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        state_tree = program.get_state_tree()
+        state_tree["trainable_variables"]["generator"]["state_generator"][
+            "prompt_template"
+        ] = "Dummy prompt template"
+        program.set_state_tree(state_tree)
+        self.assertEqual(state_tree, program.get_state_tree())
+
+    async def test_load_variables_saved_under_other_names(self):
+        # One program per conversation: same structure, names that differ.
+        first = await build_two_step_program("conversation_a")
+        first.trainable_variables[0].get_json()["instructions"] = "Draft first."
+        first.trainable_variables[1].get_json()["instructions"] = "Then refine."
+        with tempfile.TemporaryDirectory() as tmp:
+            filepath = os.path.join(tmp, "program.variables.json")
+            first.save_variables(filepath)
+            second = await build_two_step_program("conversation_b")
+            second.load_variables(filepath)
+
+        self.assertEqual(
+            [v.get_json()["instructions"] for v in second.trainable_variables],
+            ["Draft first.", "Then refine."],
+        )
+
+    async def test_load_variables_of_another_program_raises(self):
+        two_steps = await build_two_step_program("conversation_a")
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=Answer,
+            language_model=LanguageModel(model="ollama/mistral"),
+            name="only_step",
+        )(x0)
+        one_step = Program(inputs=x0, outputs=x1, name="one_step")
+
+        with self.assertRaisesRegex(ValueError, "do not match program 'one_step'"):
+            one_step.set_state_tree(two_steps.get_state_tree())
+
+    async def test_get_state_after_compile(self):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(model="ollama/mistral")
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        program.compile(
+            reward=rewards.ExactMatch(),
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+        )
+
+        state_tree = program.get_state_tree()
+
+        data_model_fields = list(AnswerWithRationale.get_schema()["properties"].keys())
+        instructions = default_instructions(data_model_fields)
+
+        expected_tree = {
+            "trainable_variables": {
+                "generator": {
+                    "state_generator": {
+                        "instructions": instructions,
+                        "examples": [],
+                        "current_predictions": [],
+                        "predictions": [],
+                        "history": [],
+                        "seed_candidates": [],
+                        "candidates": [],
+                        "best_candidates": [],
+                        "nb_visit": 0,
+                        "cumulative_reward": 0.0,
+                    }
+                }
+            },
+            "non_trainable_variables": {},
+            "optimizer_non_trainable_variables": {
+                "random_few_shot": {
+                    "iterations_random_few_shot": {
+                        "iterations": 0,
+                        "epochs": 0,
+                    },
+                },
+            },
+            "optimizer_trainable_variables": {},
+            "metrics_variables": {
+                "reward": {"total_with_count": {"total": 0.0, "count": 0}}
+            },
+        }
+        self.maxDiff = None
+        self.assertEqual(state_tree, expected_tree)
+
+    async def test_recover_state_after_compile(self):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(
+            model="ollama/mistral",
+        )
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        program.compile(
+            reward=rewards.ExactMatch(),
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+        )
+
+        state_tree = program.get_state_tree()
+        state_tree["trainable_variables"]["generator"]["state_generator"][
+            "prompt_template"
+        ] = "Dummy prompt template"
+        program.set_state_tree(state_tree)
+        self.assertEqual(state_tree, program.get_state_tree())
+
+    @patch("litellm.acompletion")
+    async def test_get_state_after_training(self, mock_completion):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(
+            model="ollama/mistral",
+        )
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        program.compile(
+            reward=rewards.ExactMatch(in_mask=["answer"]),
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+        )
+
+        (x_train, y_train), (x_test, y_test) = testing.test_utils.load_test_data()
+
+        mock_completion.side_effect = testing.test_utils.mock_completion_data()
+
+        _ = await program.fit(
+            x=x_train,
+            y=y_train,
+            batch_size=32,
+        )
+
+        _ = program.get_state_tree()
+
+    @patch("litellm.acompletion")
+    async def test_recover_state_after_training(self, mock_completion):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(
+            model="ollama/mistral",
+        )
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        program.compile(
+            reward=rewards.ExactMatch(in_mask=["answer"]),
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+        )
+
+        (x_train, y_train), (x_test, y_test) = testing.test_utils.load_test_data()
+
+        mock_completion.side_effect = testing.test_utils.mock_completion_data()
+
+        _ = await program.fit(
+            x=x_train,
+            y=y_train,
+            batch_size=32,
+        )
+
+        state_tree = program.get_state_tree()
+        program.set_state_tree(state_tree)
+        new_state_tree = program.get_state_tree()
+        self.assertEqual(state_tree, new_state_tree)
+
+    @patch("litellm.acompletion")
+    async def test_saving_after_training(self, mock_completion):
+        class Query(DataModel):
+            query: str
+
+        class AnswerWithRationale(DataModel):
+            rationale: str
+            answer: str
+
+        language_model = LanguageModel(
+            model="ollama/mistral",
+        )
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=AnswerWithRationale,
+            language_model=language_model,
+        )(x0)
+
+        program = Program(
+            inputs=x0,
+            outputs=x1,
+            name="chain_of_thought",
+            description="Useful to answer in a step by step manner.",
+        )
+
+        program.compile(
+            reward=rewards.ExactMatch(in_mask=["answer"]),
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+        )
+
+        (x_train, y_train), (x_test, y_test) = testing.test_utils.load_test_data()
+
+        mock_completion.side_effect = testing.test_utils.mock_completion_data()
+
+        _ = await program.fit(
+            x=x_train,
+            y=y_train,
+            batch_size=32,
+        )
+
+        filepath = os.path.join(tempfile.gettempdir(), "program.json")
+        program.save(filepath)
+
+        with open(filepath, "r") as f:
+            saved_config = orjson.loads(f.read())
+        # The Synalinks version is the first key of the saved program.
+        self.assertEqual(next(iter(saved_config)), "synalinks_version")
+        self.assertEqual(saved_config["synalinks_version"], __version__)
+
+        cloned_program = Program.load(filepath)
+
+        for var1 in program.variables:
+            for var2 in cloned_program.variables:
+                if remove_numerical_suffix(var1.path) == remove_numerical_suffix(
+                    var2.path
+                ):
+                    self.assertEqual(var1.get_json(), var2.get_json())
+
+
+class ProgramMLflowLineageTest(testing.TestCase):
+    async def test_save_and_load_round_trip_mlflow_lineage(self):
+        class Query(DataModel):
+            query: str
+
+        class Answer(DataModel):
+            answer: str
+
+        x0 = Input(data_model=Query)
+        x1 = await Generator(
+            data_model=Answer,
+            language_model=LanguageModel(model="ollama/mistral"),
+        )(x0)
+        program = Program(inputs=x0, outputs=x1, name="lineage")
+
+        filepath = os.path.join(tempfile.gettempdir(), "lineage_plain.json")
+        program.save(filepath)
+        with open(filepath, "r") as f:
+            self.assertNotIn("mlflow", orjson.loads(f.read()))
+
+        program._mlflow_model_id = "m-123"
+        program._mlflow_run_id = "run-abc"
+        program._mlflow_experiment_id = "exp-1"
+        filepath = os.path.join(tempfile.gettempdir(), "lineage.json")
+        program.save(filepath)
+        with open(filepath, "r") as f:
+            saved = orjson.loads(f.read())
+        self.assertEqual(
+            saved["mlflow"],
+            {
+                "model_id": "m-123",
+                "run_id": "run-abc",
+                "experiment_id": "exp-1",
+                "prompts": {},
+            },
+        )
+
+        loaded = Program.load(filepath)
+        self.assertEqual(loaded._mlflow_model_id, "m-123")
+        self.assertEqual(loaded._mlflow_run_id, "run-abc")
+        self.assertEqual(loaded._mlflow_experiment_id, "exp-1")
+
+        program._mlflow_prompts = {
+            "generator": {
+                "name": "lineage.generator",
+                "version": 2,
+                "uri": "prompts:/x/2",
+            }
+        }
+        program.save(filepath)
+        loaded = Program.load(filepath)
+        generator = [
+            m
+            for m in loaded._flatten_modules(include_self=False)
+            if m.name == "generator"
+        ]
+        self.assertEqual(len(generator), 1)
+        self.assertEqual(generator[0]._mlflow_prompt_version.name, "lineage.generator")
+        self.assertEqual(generator[0]._mlflow_prompt_version.version, 2)
